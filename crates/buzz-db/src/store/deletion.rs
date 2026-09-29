@@ -5151,6 +5151,77 @@ mod postgres_tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn privileged_abort_fences_a_live_owner_preparation_lease() {
+        let (db, store) = store().await;
+        let (host, owner, community) = archived_owned_community(&db).await;
+        let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let request_id = Uuid::new_v4();
+        store
+            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .await
+            .expect("admit owner request");
+        let claim = store
+            .claim_specific_owner_submission(request_id, "preparer", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim owner request")
+            .expect("owner request is preparable");
+        let inventory = FrozenInventory {
+            schema: store
+                .inventory_schema(community)
+                .await
+                .expect("schema inventory"),
+            storage: empty_storage_manifest(community),
+        };
+        let (lease_owner, lease_generation, lease_is_live): (Option<String>, i64, bool) =
+            sqlx::query_as(
+                "SELECT lease_owner, lease_generation, lease_until >= now() \
+                 FROM community_deletion_requests WHERE id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read live preparation lease");
+        assert_eq!(lease_owner.as_deref(), Some("preparer"));
+        assert_eq!(lease_generation, claim.lease.generation);
+        assert!(lease_is_live, "preparation lease must be live before abort");
+
+        let aborted = store
+            .abort(request_id, "recovery-operator", "cancel live preparation")
+            .await
+            .expect("abort live preparation");
+        assert_eq!(aborted.stage, DeletionStage::Aborted);
+        assert_eq!(aborted.lease_generation, claim.lease.generation + 1);
+        assert!(aborted.lease_owner.is_none());
+        assert!(aborted.lease_until.is_none());
+
+        let heartbeat_error = store
+            .heartbeat_owner_submission(&claim.lease, "drain", DEFAULT_LEASE_DURATION, false)
+            .await
+            .expect_err("aborted preparation lease cannot heartbeat");
+        assert!(is_stale_deletion_lease(&heartbeat_error));
+        let completion_error = store
+            .complete_owner_preparation(&claim.lease, &inventory)
+            .await
+            .expect_err("aborted preparation lease cannot approve");
+        assert!(is_stale_deletion_lease(&completion_error));
+
+        let request = store.get(request_id).await.expect("load aborted request");
+        assert_eq!(request.stage, DeletionStage::Aborted);
+        assert!(request.inventory_digest.is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM community_deletion_approvals WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count automatic approvals"),
+            0
+        );
+    }
+
     /// The reversible boundary extends through `fenced`. From `drained`
     /// onward, destruction may have begun, so abort must stay closed.
     #[tokio::test]
