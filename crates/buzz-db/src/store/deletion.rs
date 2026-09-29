@@ -1414,6 +1414,28 @@ impl DeletionStore {
         let storage = serde_json::to_value(&inventory.storage)?;
         let frozen = serde_json::to_value(inventory)?;
         let mut tx = self.pool.begin().await?;
+
+        lock_community_deletion_shared(&mut tx, token.community_id).await?;
+        let community = sqlx::query(
+            "SELECT archived_at, deletion_state, deleted_at FROM communities \
+             WHERE id = $1 FOR UPDATE",
+        )
+        .bind(token.community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            DbError::DeletionSafety(format!(
+                "owner deletion {} community is missing before automatic approval",
+                token.request_id
+            ))
+        })?;
+        let current_owners: Vec<String> = sqlx::query_scalar(
+            "SELECT pubkey FROM relay_members \
+             WHERE community_id = $1 AND role = 'owner' ORDER BY pubkey FOR UPDATE",
+        )
+        .bind(token.community_id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
         let request_row =
             sqlx::query("SELECT * FROM community_deletion_requests WHERE id = $1 FOR UPDATE")
                 .bind(token.request_id)
@@ -1440,6 +1462,22 @@ impl DeletionStore {
             && request.blocked_reason.is_none();
         if !lease_matches {
             return Err(stale_lease_error(token));
+        }
+        let archived_at: Option<DateTime<Utc>> = community.try_get("archived_at")?;
+        let deletion_state: String = community.try_get("deletion_state")?;
+        let deleted_at: Option<DateTime<Utc>> = community.try_get("deleted_at")?;
+        let owner_authority_matches = request.owner_pubkey.as_ref().is_some_and(|owner| {
+            current_owners.len() == 1 && current_owners.first() == Some(owner)
+        });
+        if archived_at.is_none()
+            || deletion_state != "active"
+            || deleted_at.is_some()
+            || !owner_authority_matches
+        {
+            return Err(DbError::DeletionSafety(format!(
+                "owner deletion {} community is no longer archived under the admitted owner",
+                token.request_id
+            )));
         }
         if request.stage == DeletionStage::Approved {
             let approval: Option<(Vec<u8>, String, String)> = sqlx::query_as(
@@ -5404,6 +5442,92 @@ mod postgres_tests {
             .complete_owner_preparation(&claim.lease, &changed)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_preparation_rechecks_archived_current_owner_before_automatic_approval() {
+        enum AuthorityDrift {
+            Unarchived,
+            OwnerChanged,
+        }
+
+        let mut failures = Vec::new();
+        for drift in [AuthorityDrift::Unarchived, AuthorityDrift::OwnerChanged] {
+            let label = match drift {
+                AuthorityDrift::Unarchived => "unarchived",
+                AuthorityDrift::OwnerChanged => "owner-changed",
+            };
+            let (db, store) = store().await;
+            let (host, owner, community) = archived_owned_community(&db).await;
+            let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            let request_id = Uuid::new_v4();
+            store
+                .admit_owner_request(&host, &owner, operator, 1, request_id)
+                .await
+                .expect("admit owner request");
+            let claim = store
+                .claim_specific_owner_submission(request_id, "preparer", DEFAULT_LEASE_DURATION)
+                .await
+                .expect("claim owner request")
+                .expect("owner request is preparable");
+            let inventory = FrozenInventory {
+                schema: store
+                    .inventory_schema(community)
+                    .await
+                    .expect("schema inventory"),
+                storage: empty_storage_manifest(community),
+            };
+
+            match drift {
+                AuthorityDrift::Unarchived => {
+                    sqlx::query("UPDATE communities SET archived_at = NULL WHERE id = $1")
+                        .bind(community.as_uuid())
+                        .execute(&db.pool)
+                        .await
+                        .expect("simulate stale archive authority");
+                }
+                AuthorityDrift::OwnerChanged => {
+                    sqlx::query(
+                        "UPDATE relay_members SET role = 'member' \
+                         WHERE community_id = $1 AND pubkey = $2 AND role = 'owner'",
+                    )
+                    .bind(community.as_uuid())
+                    .bind(&owner)
+                    .execute(&db.pool)
+                    .await
+                    .expect("simulate stale owner authority");
+                }
+            }
+
+            let completion = store
+                .complete_owner_preparation(&claim.lease, &inventory)
+                .await;
+            let request = store.get(request_id).await.expect("load request");
+            let approval_count = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM community_deletion_approvals WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count automatic approvals");
+            if completion.is_ok()
+                || request.stage != DeletionStage::Submitted
+                || request.inventory_digest.is_some()
+                || approval_count != 0
+            {
+                failures.push(format!(
+                    "{label}: completion={completion:?}, stage={}, inventory_frozen={}, approvals={approval_count}",
+                    request.stage,
+                    request.inventory_digest.is_some(),
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "stale owner authority reached automatic approval: {failures:#?}"
+        );
     }
 
     #[tokio::test]
