@@ -1197,11 +1197,19 @@ mod tests {
                     MetricsInstallFailure::Bind,
                     "a non-local interface must fail at the bind"
                 ),
-                // The bind itself succeeded, so the process-global recorder is
-                // what rejected the second install. Name that explicitly: a
-                // reader hitting this after a refactor should not have to work
-                // out that `RecorderConflict` here means "the bind did not fail".
-                Ok(()) => panic!("a non-local interface bound; the listener ignored the address"),
+                // Unreachable, and kept only because `match` must be total.
+                // `try_install` calls `set_global_recorder` before returning
+                // `Ok(())`, and the recorder is process-global: the first call
+                // above already registered one, so the second can only ever
+                // reach here as `Err(RecorderConflict)`. Worth stating plainly
+                // because the arm looks like it is asserting the regression
+                // directly, and it is not — it is the `Err` arm below that
+                // catches it. Under a wildcard bind the second call *succeeds*
+                // at binding (port 0 means a fresh ephemeral port, so there is
+                // no address-in-use conflict) and is rejected by the recorder
+                // instead, which is why the `Err` arm asserts `Bind` and a
+                // wildcard regression surfaces as `RecorderConflict`.
+                Ok(()) => panic!("the second try_install returned Ok; the recorder is no longer process-global"),
             }
             return;
         }
